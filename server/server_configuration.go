@@ -31,6 +31,7 @@ import (
 
 // loadConfiguration manages dynamically frontends, backends and TLS configurations
 func (s *Server) loadConfiguration(configMsg types.ConfigMessage) {
+	log.Debugf("loading configuration %+v", configMsg)
 	currentConfigurations := s.currentConfigurations.Get().(types.Configurations)
 
 	// Copy configurations to new map so we don't change current if LoadConfig fails
@@ -63,7 +64,7 @@ func (s *Server) loadConfiguration(configMsg types.ConfigMessage) {
 			s.serverEntryPoints[newServerEntryPointName].certs.DynamicCerts.Set(newServerEntryPoint.certs.DynamicCerts.Get())
 			s.serverEntryPoints[newServerEntryPointName].certs.ResetCache()
 		}
-		log.Infof("Server configuration reloaded on %s", s.serverEntryPoints[newServerEntryPointName].httpServer.Addr)
+		//log.Infof("Server configuration reloaded on %s", s.serverEntryPoints[newServerEntryPointName].httpServer.Addr)
 	}
 
 	s.currentConfigurations.Set(newConfigurations)
@@ -90,10 +91,12 @@ func (s *Server) loadConfig(configurations types.Configurations, globalConfigura
 
 	var postConfigs []handlerPostConfig
 
+	log.Debugf("loading configs %+v", configurations["docker"])
 	for providerName, config := range configurations {
 		frontendNames := sortedFrontendNamesForConfig(config)
 
 		for _, frontendName := range frontendNames {
+			log.Debugf("loading FE config %s", frontendName)
 			frontendPostConfigs, err := s.loadFrontendConfig(providerName, frontendName, config,
 				redirectHandlers, serverEntryPoints,
 				backendsHandlers, backendsHealthCheck)
@@ -148,6 +151,11 @@ func (s *Server) loadFrontendConfig(
 	backend := config.Backends[frontend.Backend]
 	if backend == nil {
 		return nil, fmt.Errorf("undefined backend '%s' for frontend %s", frontend.Backend, frontendName)
+	}
+
+	if backend.UDP {
+		log.Debugf("ignoring udp backend %s", frontend.Backend)
+		return nil, nil
 	}
 
 	frontendHash, err := frontend.Hash()

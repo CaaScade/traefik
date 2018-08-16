@@ -20,6 +20,7 @@ type EntryPoint struct {
 	Compress             *Compress         `export:"true"`
 	ProxyProtocol        *ProxyProtocol    `export:"true"`
 	ForwardedHeaders     *ForwardedHeaders `export:"true"`
+	UDP                  bool              `export:"true"`
 }
 
 // Compress contains compress configuration

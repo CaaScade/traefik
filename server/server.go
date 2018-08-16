@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"time"
 
@@ -126,7 +127,9 @@ type EntryPoint struct {
 type serverEntryPoints map[string]*serverEntryPoint
 
 type serverEntryPoint struct {
+	udp                     bool
 	httpServer              *h2c.Server
+	udpListener             *net.UDPConn
 	listener                net.Listener
 	httpRouter              *middlewares.HandlerSwitcher
 	certs                   *traefiktls.CertificateStore
@@ -136,6 +139,9 @@ type serverEntryPoint struct {
 }
 
 func (s serverEntryPoint) Shutdown(ctx context.Context) {
+	if s.udp {
+		return
+	}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -219,7 +225,7 @@ func NewServer(globalConfiguration configuration.GlobalConfiguration, provider p
 
 // Start starts the server.
 func (s *Server) Start() {
-	s.startHTTPServers()
+	s.startServers()
 	s.startLeadership()
 	s.routinesPool.Go(func(stop chan bool) {
 		s.listenProviders(stop)
@@ -312,7 +318,7 @@ func (s *Server) stopLeadership() {
 	}
 }
 
-func (s *Server) startHTTPServers() {
+func (s *Server) startServers() {
 	s.serverEntryPoints = s.buildServerEntryPoints()
 
 	for newServerEntryPointName, newServerEntryPoint := range s.serverEntryPoints {
@@ -483,8 +489,102 @@ func (s *Server) createTLSConfig(entryPointName string, tlsOption *traefiktls.TL
 }
 
 func (s *Server) startServer(serverEntryPoint *serverEntryPoint) {
-	log.Infof("Starting server on %s", serverEntryPoint.httpServer.Addr)
 
+	if serverEntryPoint.udp {
+		defaultBackendAddrs := []string{}
+		backendAddrs := []string{}
+		buf := make([]byte, 8092)
+		curr := -1
+		for {
+			feLen, feAddr, err := serverEntryPoint.udpListener.ReadFromUDP(buf)
+			if err != nil {
+				log.Error(err)
+				continue
+			}
+			if len(backendAddrs) == 0 {
+				for _, config := range s.currentConfigurations.Get().(types.Configurations) {
+					for n, f := range config.Frontends {
+						if c, ok := config.Backends[f.Backend]; !ok {
+							log.Fatalf("invalid backend for frontend %s", n)
+						} else {
+							if c.UDP {
+								for _, url := range f.EntryPoints {
+									addr := serverEntryPoint.udpListener.LocalAddr().(*net.UDPAddr)
+									addrStr := ""
+									if addr.IP.IsUnspecified() {
+										addrStr = fmt.Sprintf("%d", addr.Port)
+									} else {
+										addrStr = fmt.Sprintf("%s:%d", addr.IP, addr.Port)
+									}
+									if url == addrStr {
+										for _, serv := range c.Servers {
+											backendAddrs = append(backendAddrs, serv.URL)
+										}
+									}
+								}
+								if len(f.EntryPoints) == 0 {
+									for _, serv := range c.Servers {
+										defaultBackendAddrs = append(defaultBackendAddrs, serv.URL)
+									}
+								}
+							}
+						}
+					}
+					if len(backendAddrs) == 0 {
+						backendAddrs = defaultBackendAddrs
+					}
+				}
+				if len(backendAddrs) == 0 {
+					addr := serverEntryPoint.udpListener.LocalAddr().(*net.UDPAddr)
+					addrStr := ""
+					if addr.IP.IsUnspecified() {
+						addrStr = fmt.Sprintf("%d", addr.Port)
+					} else {
+						addrStr = fmt.Sprintf("%s:%d", addr.IP, addr.Port)
+					}
+					log.Fatalf("no backends detected for %s", addrStr)
+				}
+			}
+			curr = curr + 1
+			curr = curr % len(backendAddrs)
+
+			ipStr, portStr, err := net.SplitHostPort(backendAddrs[curr])
+			if err != nil {
+				log.Error("Error preparing server: ", err)
+			}
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				log.Error("Error preparing server: ", err)
+			}
+			ip := net.ParseIP(ipStr)
+			if err != nil {
+				log.Error("Error preparing server: ", err)
+			}
+			conn, err := net.DialUDP("udp", nil, &net.UDPAddr{
+				IP:   ip,
+				Port: port,
+			})
+			defer conn.Close()
+			_, err = conn.Write(buf[:feLen])
+			if err != nil {
+				log.Error("Error writing to backend: ", err)
+				continue
+			}
+			beLen, err := conn.Read(buf)
+			if err != nil {
+				log.Error("Error reading from backend: ", err)
+				continue
+			}
+			_, err = serverEntryPoint.udpListener.WriteTo(buf[:beLen], feAddr)
+			if err != nil {
+				log.Error("Error writing back to frontend: ", err)
+				continue
+			}
+		}
+		return
+	}
+
+	log.Infof("Starting server on %s", serverEntryPoint.httpServer.Addr)
 	var err error
 	if serverEntryPoint.httpServer.TLSConfig != nil {
 		err = serverEntryPoint.httpServer.ServeTLS(serverEntryPoint.listener, "", "")
@@ -498,6 +598,32 @@ func (s *Server) startServer(serverEntryPoint *serverEntryPoint) {
 }
 
 func (s *Server) setupServerEntryPoint(newServerEntryPointName string, newServerEntryPoint *serverEntryPoint) *serverEntryPoint {
+	if s.entryPoints[newServerEntryPointName].Configuration.UDP {
+		newServerEntryPoint.udp = true
+		log.Debugf("[UDP] listening on address %s", s.entryPoints[newServerEntryPointName].Configuration.Address)
+		ipStr, portStr, err := net.SplitHostPort(s.entryPoints[newServerEntryPointName].Configuration.Address)
+		if err != nil {
+			log.Fatal("Error preparing server: ", err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			log.Fatal("Error preparing server: ", err)
+		}
+		ip := net.ParseIP(ipStr)
+		if err != nil {
+			log.Fatal("Error preparing server: ", err)
+		}
+		listener, err := net.ListenUDP("udp", &net.UDPAddr{
+			IP:   ip,
+			Port: port,
+		})
+		if err != nil {
+			log.Fatal("xError preparing server: ", err)
+		}
+		newServerEntryPoint.udpListener = listener
+		return newServerEntryPoint
+	}
+
 	serverMiddlewares, err := s.buildServerEntryPointMiddlewares(newServerEntryPointName)
 	if err != nil {
 		log.Fatal("Error preparing server: ", err)

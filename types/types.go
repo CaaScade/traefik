@@ -28,6 +28,7 @@ type Backend struct {
 	MaxConn        *MaxConn          `json:"maxConn,omitempty"`
 	HealthCheck    *HealthCheck      `json:"healthCheck,omitempty"`
 	Buffering      *Buffering        `json:"buffering,omitempty"`
+	UDP            bool              `json:"udp,omitempty"`
 }
 
 // MaxConn holds maximum connection configuration
